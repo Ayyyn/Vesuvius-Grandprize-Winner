@@ -8,15 +8,14 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import WandbLogger
-
+# from pytorch_lightning.loggers import WandbLogger
+import gc
 import random
-import yaml
 
 import numpy as np
 import pandas as pd
 
-import wandb
+# import wandb
 
 from torch.utils.data import DataLoader
 
@@ -44,14 +43,43 @@ from torch.utils.data import DataLoader, Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset
-from models.i3dallnl import InceptionI3d
+# from models.i3dallnl import InceptionI3d
 import torch.nn as nn
 import torch
-from warmup_scheduler import GradualWarmupScheduler
+# from warmup_scheduler import GradualWarmupScheduler
 from scipy import ndimage
-from models.resnetall import generate_model
+from resnetall import generate_model
 import PIL.Image
+from PIL import Image
 PIL.Image.MAX_IMAGE_PIXELS = 933120000
+
+from tap import Tap
+class InferenceArgumentParser(Tap):
+    parser = argparse.ArgumentParser(description="Process a value dynamically.")
+    parser.add_argument('--val_segment_id', help="Segment id for inference")
+    parser.add_argument('--segment_path', help="Path of segment for inference")
+    parser.add_argument('--model_path', help="Model path")
+    parser.add_argument('--out_path', help="inference output path")
+    # parser.add_argument('--model_name', help="name of model")
+
+    #example command with arguments
+    #python inference_timesformer.py --segment_id 20230701020044 --segment_path /path/to/segment --model_path /path/to/model --out_path /path/to/output
+    # Parse the arguments
+    args = parser.parse_args()
+
+    val_segment_id:str =args.val_segment_id
+    segment_path:str=args.segment_path
+    model_path:str=args.model_path
+    out_path:str=args.out_path
+    # model_name:str=args.model_name
+
+    print(f"{val_segment_id=}")
+    print(f"{segment_path=}")
+    print(f"{model_path=}")
+    print(f"{out_path=}")
+
+args = InferenceArgumentParser().parse_args()
+
 class CFG:
     # ============== comp exp name =============
     comp_name = 'vesuvius'
@@ -60,7 +88,8 @@ class CFG:
     comp_dir_path = './'
     comp_folder_name = './'
     # comp_dataset_path = f'{comp_dir_path}datasets/{comp_folder_name}/'
-    comp_dataset_path = f'./'
+    # comp_dataset_path = f'./'
+    comp_dataset_path = f'/content/t1/vesuvius_model/training/'
     
     exp_name = 'pretraining_all'
 
@@ -77,37 +106,38 @@ class CFG:
     # ============== training cfg =============
     size = 256
     tile_size = 256
-    stride = tile_size // 8
+    # stride = tile_size // 8
+    stride = 32
 
-    train_batch_size = 50 # 32
+    train_batch_size = 16 # 32
     valid_batch_size = train_batch_size
-    use_amp = True
+    # use_amp = True
 
-    scheduler = 'GradualWarmupSchedulerV2'
+    # scheduler = 'GradualWarmupSchedulerV2'
     # scheduler = 'CosineAnnealingLR'
-    epochs = 30 # 30
+    epochs = 10 # 30
 
     # adamW warmupあり
-    warmup_factor = 10
+    # warmup_factor = 10
     # lr = 1e-4 / warmup_factor
     # lr = 1e-4 / warmup_factor
-    lr = 2e-5
+    lr = 3e-5
     # ============== fold =============
-    valid_id = '20230820203112'
+    valid_id = '20230531121653'
 
     # objective_cv = 'binary'  # 'binary', 'multiclass', 'regression'
-    metric_direction = 'maximize'  # maximize, 'minimize'
+    # metric_direction = 'maximize'  # maximize, 'minimize'
     # metrics = 'dice_coef'
 
     # ============== fixed =============
-    pretrained = True
-    inf_weight = 'best'  # 'best'
+    # pretrained = True
+    # inf_weight = 'best'  # 'best'
 
-    min_lr = 1e-6
-    weight_decay = 1e-6
-    max_grad_norm = 100
+    # min_lr = 1e-6
+    # weight_decay = 1e-6
+    # max_grad_norm = 100
 
-    print_freq = 50
+    # print_freq = 50
     num_workers = 16
 
     seed = 130697
@@ -115,7 +145,7 @@ class CFG:
     # ============== set dataset path =============
     print('set dataset path')
 
-    outputs_path = f'./outputs/{comp_name}/{exp_name}/'
+    outputs_path = f'{comp_dataset_path}/outputs/{comp_name}/{exp_name}/'
 
     submission_dir = outputs_path + 'submissions/'
     submission_path = submission_dir + f'submission_{exp_name}.csv'
@@ -165,17 +195,17 @@ class CFG:
         ToTensorV2(transpose_mask=True),
     ]
     rotate = A.Compose([A.Rotate(5,p=1)])
-def init_logger(log_file):
-    from logging import getLogger, INFO, FileHandler, Formatter, StreamHandler
-    logger = getLogger(__name__)
-    logger.setLevel(INFO)
-    handler1 = StreamHandler()
-    handler1.setFormatter(Formatter("%(message)s"))
-    handler2 = FileHandler(filename=log_file)
-    handler2.setFormatter(Formatter("%(message)s"))
-    logger.addHandler(handler1)
-    logger.addHandler(handler2)
-    return logger
+# def init_logger(log_file):
+#     from logging import getLogger, INFO, FileHandler, Formatter, StreamHandler
+#     logger = getLogger(__name__)
+#     logger.setLevel(INFO)
+#     handler1 = StreamHandler()
+#     handler1.setFormatter(Formatter("%(message)s"))
+#     handler2 = FileHandler(filename=log_file)
+#     handler2.setFormatter(Formatter("%(message)s"))
+#     logger.addHandler(handler1)
+#     logger.addHandler(handler2)
+#     return logger
 
 def set_seed(seed=None, cudnn_deterministic=True):
     if seed is None:
@@ -202,22 +232,38 @@ cfg_init(CFG)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def read_image_mask(fragment_id,start_idx=15,end_idx=45):
-
+def read_image_mask(fragment_id,start_idx=60,end_idx=90):
+    fragment_id_ = fragment_id.split("_")[0]
     images = []
-
+    if fragment_id==args.val_segment_id:
+      start_idx = 17
+      end_idx = 47
     # idxs = range(65)
-    mid = 65 // 2
-    start = mid - CFG.in_chans // 2
-    end = mid + CFG.in_chans // 2
+    # mid = 65 // 2
+    # start = mid - CFG.in_chans // 2
+    # end = mid + CFG.in_chans // 2
     idxs = range(start_idx, end_idx)
 
     for i in idxs:
-        
-        image = cv2.imread(f"train_scrolls/{fragment_id}/layers/{i:02}.tif", 0)
+        if os.path.exists(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.tif"):
+            image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.tif", 0)
+        elif os.path.exists(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.jpg"):
+            image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.jpg", 0)
+        elif os.path.exists(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:03}.tif"):
+            image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:03}.tif", 0)
+        elif os.path.exists(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:03}.jpg"):
+            image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:03}.jpg", 0)
 
-        pad0 = (256 - image.shape[0] % 256)
-        pad1 = (256 - image.shape[1] % 256)
+        if i==27 or i==70:
+            print(f"{fragment_id}: {i} layer found")
+            print(f"before padding: {fragment_id} layer shape= {image.shape}")
+
+        # width_m1 = int(image.shape[1]//(30/14.5))
+        # width_m2 = int(image.shape[1]//(30/19.5))
+        # image=image[:, image.shape[1]//4:]
+
+        pad0 = (CFG.tile_size - image.shape[0] % CFG.tile_size)
+        pad1 = (CFG.tile_size - image.shape[1] % CFG.tile_size)
 
         image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
         # image = ndimage.median_filter(image, size=5)
@@ -226,53 +272,95 @@ def read_image_mask(fragment_id,start_idx=15,end_idx=45):
         if 'frag' in fragment_id:
             image = cv2.resize(image, (image.shape[1]//2,image.shape[0]//2), interpolation = cv2.INTER_AREA)
         image=np.clip(image,0,200)
-        if fragment_id=='20230827161846':
+        if fragment_id_=='20230827161846':
             image=cv2.flip(image,0)
+        # if fragment_id != args.val_segment_id:
+        #     image=image[1361:3038, 2272:3513]
         images.append(image)
     images = np.stack(images, axis=2)
-    if fragment_id in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']:
 
-        images=images[:,:,::-1]
-
-    if fragment_id in ['20231022170901','20231022170900']:
-        mask = cv2.imread( f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.tiff", 0)
+    #********************************label********************************
+    # if fragment_id_ in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']:
+    # if fragment_id_ in ['20240820133348','20240814122007', '20240814125124']:
+    #     images=images[:,:,::-1] #reverse the order of the image slices
+    if fragment_id_ in ['20231022170901','20231022170900']:
+        mask = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id_}_inklabels.tiff", 0)
     else:
-        mask = cv2.imread( f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", 0)
+        if os.path.exists(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id_}_inklabels.png"):
+            #print the path of the mask
+            print(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id_}_inklabels.png")
+            print(f"{fragment_id}: inklabel found")
+            mask = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id_}_inklabels.png", 0)
+        else:
+            print(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id_}_inklabels.png")
+            print(f"{fragment_id}: inklabel not found")
 
-    # mask = np.pad(mask, [(0, pad0), (0, pad1)], constant_values=0)
-    fragment_mask=cv2.imread(f"train_scrolls/{fragment_id}/{fragment_id}_mask.png", 0)
-    if fragment_id=='20230827161846':
+    # mask = mask[:, width_m1:width_m2]
+    # if fragment_id != args.val_segment_id: 
+    #     mask = mask[1361:3038, 2272:3513]  
+    # mask = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id_}_inklabels.png", 0)
+    # if fragment_id != args.val_segment_id:
+    #   mask = np.pad(mask, [(0, pad0), (0, pad1)], constant_values=0)
+
+
+    #***********************************fragment mask********************************
+    if os.path.exists(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id_}_mask.png"):
+        print(f"{fragment_id}: mask found")
+    else:
+        print(f"{fragment_id}: mask not found")
+
+    fragment_mask=cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id_}_mask.png", 0)
+    if fragment_id_=='20230827161846':
         fragment_mask=cv2.flip(fragment_mask,0)
 
+    # fragment_mask = fragment_mask[:, fragment_mask.shape[1]//4:]
     fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
 
+    #******************
     kernel = np.ones((16,16),np.uint8)
     if 'frag' in fragment_id:
         fragment_mask = cv2.resize(fragment_mask, (fragment_mask.shape[1]//2,fragment_mask.shape[0]//2), interpolation = cv2.INTER_AREA)
         mask = cv2.resize(mask , (mask.shape[1]//2,mask.shape[0]//2), interpolation = cv2.INTER_AREA)
 
+    #normalize the mask
     mask = mask.astype('float32')
     mask/=255
+    # if fragment_id != args.val_segment_id:
+        # fragment_mask = fragment_mask[1361:3038, 2272:3513]
+
+    print(f"{fragment_id} layer shape= {images.shape}")
+    print(f"{fragment_id} label shape: {mask.shape}")
+    print(f"{fragment_id} mask shape: {fragment_mask.shape}")
     assert images.shape[0]==mask.shape[0]
     return images, mask,fragment_mask
 
-def get_train_valid_dataset():
+def get_train_valid_dataset(segment_list):
     train_images = []
     train_masks = []
 
     valid_images = []
     valid_masks = []
     valid_xyxys = []
-    for fragment_id in ['20231210121321','20231106155350','20231005123336','20230820203112','20230620230619','20230826170124','20230702185753','20230522215721','20230531193658','20230520175435','20230903193206','20230902141231','20231007101615','20230929220924','recto','verso','20231016151000','20231012184423','20231031143850']:  
+    # for fragment_id in [args.valid_segment_id,'20231106155350','20231005123336','20230820203112','20230620230619','20230826170124','20230702185753','20230522215721','20230531193658','20230520175435','20230903193206','20230902141231','20231007101615','20230929220924','recto','verso','20231016151000','20231012184423','20231031143850']:  
     # for fragment_id in ['20230820203112','20231005123333']:
-#,
-        
     # for fragment_id in ['20230522181603','20230702185752','20230827161847','20230909121925','20230905134255','20230904135535']:
+    for fragment_id in segment_list:
         print('reading ',fragment_id)
+        # try:
+        #     image, mask,fragment_mask = read_image_mask(fragment_id)
+        #     print("******{fragment_id}******")
+        #     print(f"{image.shape=}")
+        #     print(f"{mask.shape=}")
+        #     print(f"{fragment_mask.shape=}")
+        # except:
+        #     print(f"couldnt load {fragment_id}!")
         image, mask,fragment_mask = read_image_mask(fragment_id)
-        stride= CFG.stride
-        x1_list = list(range(0, image.shape[1]-CFG.tile_size+1,stride))
-        y1_list = list(range(0, image.shape[0]-CFG.tile_size+1, stride))
+        # print("******{fragment_id}******")
+        # print(f"{image.shape=}")
+        # print(f"{mask.shape=}")
+        # print(f"{fragment_mask.shape=}")
+        x1_list = list(range(0, image.shape[1]-CFG.tile_size+1, CFG.stride))
+        y1_list = list(range(0, image.shape[0]-CFG.tile_size+1, CFG.stride))
         windows_dict={}
         for a in y1_list:
             for b in x1_list:
@@ -283,24 +371,21 @@ def get_train_valid_dataset():
                         y2=y1+CFG.size
                         x2=x1+CFG.size
                         if fragment_id!=CFG.valid_id:
-                            if (y1,y2,x1,x2) not in windows_dict:
-                                if not np.all(mask[a:a + CFG.tile_size, b:b + CFG.tile_size]<0.01):
-                                    if not np.any(fragment_mask[a:a+ CFG.tile_size, b:b + CFG.tile_size]==0):
+                            if not np.all(mask[a:a + CFG.tile_size, b:b + CFG.tile_size]<0.01):
+                                if not np.any(fragment_mask[a:a+ CFG.tile_size, b:b + CFG.tile_size]==0):
+                                    if (y1,y2,x1,x2) not in windows_dict:
                                         train_images.append(image[y1:y2, x1:x2])
                                         
                                         train_masks.append(mask[y1:y2, x1:x2, None])
                                         assert image[y1:y2, x1:x2].shape==(CFG.size,CFG.size,CFG.in_chans)
                                         windows_dict[(y1,y2,x1,x2)]='1'
                         if fragment_id==CFG.valid_id:
-                            if (y1,y2,x1,x2) not in windows_dict:
-                                if not np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size]==0):
-                                        valid_images.append(image[y1:y2, x1:x2])
-                                        valid_masks.append(mask[y1:y2, x1:x2, None])
+                            if not np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size]==0):
+                                    valid_images.append(image[y1:y2, x1:x2])
+                                    valid_masks.append(mask[y1:y2, x1:x2, None])
 
-                                        valid_xyxys.append([x1, y1, x2, y2])
-                                        assert image[y1:y2, x1:x2].shape==(CFG.size,CFG.size,CFG.in_chans)
-                                        windows_dict[(y1,y2,x1,x2)]='1'
-
+                                    valid_xyxys.append([x1, y1, x2, y2])
+                                    assert image[y1:y2, x1:x2].shape==(CFG.size,CFG.size,CFG.in_chans)
 
     return train_images, train_masks, valid_images, valid_masks, valid_xyxys
 
@@ -337,7 +422,8 @@ class CustomDataset(Dataset):
         return x
     def fourth_augment(self,image):
         image_tmp = np.zeros_like(image)
-        cropping_num = random.randint(24, 30)
+        # cropping_num = random.randint(24, 30)
+        cropping_num = random.randint(CFG.in_chans-6, CFG.in_chans)
 
         start_idx = random.randint(0, self.cfg.in_chans - cropping_num)
         crop_indices = np.arange(start_idx, start_idx + cropping_num)
@@ -372,12 +458,12 @@ class CustomDataset(Dataset):
             image = self.images[idx]
             label = self.labels[idx]
             #3d rotate
-            # image=image.transpose(2,1,0)#(c,w,h)
-            # image=self.rotate(image=image)['image']
-            # image=image.transpose(0,2,1)#(c,h,w)
-            # image=self.rotate(image=image)['image']
-            # image=image.transpose(0,2,1)#(c,w,h)
-            # image=image.transpose(2,1,0)#(h,w,c)
+            image=image.transpose(2,1,0)#(c,w,h)
+            image=self.rotate(image=image)['image']
+            image=image.transpose(0,2,1)#(c,h,w)
+            image=self.rotate(image=image)['image']
+            image=image.transpose(0,2,1)#(c,w,h)
+            image=image.transpose(2,1,0)#(h,w,c)
 
             image=self.fourth_augment(image)
             
@@ -410,9 +496,9 @@ class CustomDatasetTest(Dataset):
 
 
 # from resnetall import generate_model
-def init_weights(m):
-    if isinstance(m, nn.Conv2d):
-        nn.init.kaiming_normal_(m, mode='fan_out', nonlinearity='relu')
+# def init_weights(m):
+#     if isinstance(m, nn.Conv2d):
+#         nn.init.kaiming_normal_(m, mode='fan_out', nonlinearity='relu')
 class Decoder(nn.Module):
     def __init__(self, encoder_dims, upscale):
         super().__init__()
@@ -451,21 +537,28 @@ class RegressionPLModel(pl.LightningModule):
         self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
         self.loss_func= lambda x,y:0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
 
-        self.backbone = generate_model(model_depth=101, n_input_channels=1,forward_features=True,n_classes=1039)
-        state_dict=torch.load('./r3d101_KM_200ep.pth')["state_dict"]
-        conv1_weight = state_dict['conv1.weight']
-        state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-        self.backbone.load_state_dict(state_dict,strict=False)
+        self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=1139)
+        # state_dict=torch.load('./r3d101_KM_200ep.pth')["state_dict"]
+        # state_dict=torch.load(args.model_path)["state_dict"]
+        # conv1_weight = state_dict['conv1.weight']
+        # state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
+        
+        # conv1_weight = state_dict['backbone.conv1.weight']
+        # state_dict['backbone.conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
+        
+        # self.backbone.load_state_dict(state_dict,strict=False)
+        #freeze the convolution layers' parameters in the backbone
+        # for param in self.backbone.parameters():
+        #     param.requires_grad_ = False
+
+        # self.backbone.requires_grad_(False)
+
         # self.backbone=InceptionI3d(in_channels=1,num_classes=512,non_local=True)
         # self.backbone.load_state_dict(torch.load('./pretraining_i3d_epoch=3.pt'),strict=False)
         self.decoder = Decoder(encoder_dims=[x.size(1) for x in self.backbone(torch.rand(1,1,20,256,256))], upscale=1)
 
         if self.hparams.with_norm:
             self.normalization=nn.BatchNorm3d(num_features=1)
-
-
-
-            
     def forward(self, x):
         if x.ndim==4:
             x=x[:,None]
@@ -501,117 +594,132 @@ class RegressionPLModel(pl.LightningModule):
     
     def on_validation_epoch_end(self):
         self.mask_pred = np.divide(self.mask_pred, self.mask_count, out=np.zeros_like(self.mask_pred), where=self.mask_count!=0)
-        wandb_logger.log_image(key="masks", images=[np.clip(self.mask_pred,0,1)], caption=["probs"])
+        # wandb_logger.log_image(key="masks", images=[np.clip(self.mask_pred,0,1)], caption=["probs"])
 
         #reset mask
         self.mask_pred = np.zeros(self.hparams.pred_shape)
         self.mask_count = np.zeros(self.hparams.pred_shape)
-    def configure_optimizers(self):
 
-        optimizer = AdamW(self.parameters(), lr=CFG.lr)
+    def configure_optimizers(self):
+        # optimizer = AdamW(self.parameters(), lr=CFG.lr)
+        optimizer = AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr = CFG.lr)
         scheduler =torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=3e-4,pct_start=0.15, steps_per_epoch=self.hparams.total_steps, epochs=50,final_div_factor=1e2)
+
         # scheduler = get_scheduler(CFG, optimizer)
         return [optimizer],[scheduler]
 
-
-
-class GradualWarmupSchedulerV2(GradualWarmupScheduler):
-    """
-    https://www.kaggle.com/code/underwearfitting/single-fold-training-of-resnet200d-lb0-965
-    """
-    def __init__(self, optimizer, multiplier, total_epoch, after_scheduler=None):
-        super(GradualWarmupSchedulerV2, self).__init__(
-            optimizer, multiplier, total_epoch, after_scheduler)
-
-    def get_lr(self):
-        if self.last_epoch > self.total_epoch:
-            if self.after_scheduler:
-                if not self.finished:
-                    self.after_scheduler.base_lrs = [
-                        base_lr * self.multiplier for base_lr in self.base_lrs]
-                    self.finished = True
-                return self.after_scheduler.get_lr()
-            return [base_lr * self.multiplier for base_lr in self.base_lrs]
-        if self.multiplier == 1.0:
-            return [base_lr * (float(self.last_epoch) / self.total_epoch) for base_lr in self.base_lrs]
-        else:
-            return [base_lr * ((self.multiplier - 1.) * self.last_epoch / self.total_epoch + 1.) for base_lr in self.base_lrs]
-
-def get_scheduler(cfg, optimizer):
-    scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 50, eta_min=1e-6)
-    scheduler = GradualWarmupSchedulerV2(
-        optimizer, multiplier=1.0, total_epoch=1, after_scheduler=scheduler_cosine)
-
-    return scheduler
-
-def scheduler_step(scheduler, avg_val_loss, epoch):
-    scheduler.step(epoch)
    
 
+if __name__ == '__main__':
 
+    fragment_id = args.val_segment_id
+    # valid_mask_gt = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", 0)
+    # # valid_mask_gt=cv2.resize(valid_mask_gt,(valid_mask_gt.shape[1]//2,valid_mask_gt.shape[0]//2),cv2.INTER_AREA)
+    # pred_shape=valid_mask_gt.shape
+    torch.set_float32_matmul_precision('medium')
 
-fragment_id = CFG.valid_id
+    fragments=[args.val_segment_id]
+    enc_i,enc,fold=0,'i3d',0
+    for fid in fragments:
+        CFG.valid_id=fid
+        fragment_id = CFG.valid_id
+        run_slug=f'training_scrolls_valid={fragment_id}_{CFG.size}x{CFG.size}_submissionlabels_ftune'
 
-valid_mask_gt = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", 0)
-# valid_mask_gt=cv2.resize(valid_mask_gt,(valid_mask_gt.shape[1]//2,valid_mask_gt.shape[0]//2),cv2.INTER_AREA)
-pred_shape=valid_mask_gt.shape
-torch.set_float32_matmul_precision('medium')
+        valid_mask_gt = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", 0)
 
-fragments=['20231210121321']
-enc_i,enc,fold=0,'i3d',0
-for fid in fragments:
-    CFG.valid_id=fid
-    fragment_id = CFG.valid_id
-    run_slug=f'training_scrolls_valid={fragment_id}_{CFG.size}x{CFG.size}_submissionlabels_wild11'
+        pred_shape=valid_mask_gt.shape
+        segment_list = ['20231111135345', '20230531121653']
+        train_images, train_masks, valid_images, valid_masks, valid_xyxys = get_train_valid_dataset(segment_list)
+        print(len(train_images))
+        valid_xyxys = np.stack(valid_xyxys)
+        train_dataset = CustomDataset(
+            train_images, CFG, labels=train_masks, transform=get_transforms(data='train', cfg=CFG))
+        valid_dataset = CustomDataset(
+            valid_images, CFG,xyxys=valid_xyxys, labels=valid_masks, transform=get_transforms(data='valid', cfg=CFG))
 
-    valid_mask_gt = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", 0)
+        train_loader = DataLoader(train_dataset,
+                                    batch_size=CFG.train_batch_size,
+                                    shuffle=True,
+                                    num_workers=CFG.num_workers, pin_memory=True, drop_last=True,
+                                    )
+        valid_loader = DataLoader(valid_dataset,
+                                    batch_size=CFG.valid_batch_size,
+                                    shuffle=False,
+                                    num_workers=CFG.num_workers, pin_memory=True, drop_last=True)
 
-    pred_shape=valid_mask_gt.shape
+        # wandb_logger = WandbLogger(project="vesivus",name=run_slug+f'{enc}_finetune')
+        norm=fold==1
+        model=RegressionPLModel(enc='i3d',pred_shape=pred_shape,size=CFG.size,total_steps=len(train_loader))
 
-    train_images, train_masks, valid_images, valid_masks, valid_xyxys = get_train_valid_dataset()
-    print(len(train_images))
-    valid_xyxys = np.stack(valid_xyxys)
-    train_dataset = CustomDataset(
-        train_images, CFG, labels=train_masks, transform=get_transforms(data='train', cfg=CFG))
-    valid_dataset = CustomDataset(
-        valid_images, CFG,xyxys=valid_xyxys, labels=valid_masks, transform=get_transforms(data='valid', cfg=CFG))
+        #for finetuning
+        model.load_state_dict(torch.load(args.model_path)["state_dict"])
 
-    train_loader = DataLoader(train_dataset,
-                                batch_size=CFG.train_batch_size,
-                                shuffle=True,
-                                num_workers=CFG.num_workers, pin_memory=True, drop_last=True,
-                                )
-    valid_loader = DataLoader(valid_dataset,
-                                batch_size=CFG.valid_batch_size,
-                                shuffle=False,
-                                num_workers=CFG.num_workers, pin_memory=True, drop_last=True)
+        for module in model.modules():
+        # print(module)
+            if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.BatchNorm3d):
+                if hasattr(module, 'weight'):
+                    module.weight.requires_grad_(False)
+                if hasattr(module, 'bias'):
+                    module.bias.requires_grad_(False)
+                module.eval()
 
-    wandb_logger = WandbLogger(project="vesivus",name=run_slug+f'{enc}_finetune')
-    norm=fold==1
-    model=RegressionPLModel(enc='i3d',pred_shape=pred_shape,size=CFG.size,total_steps=len(train_loader))
+        # Freeze only the 'backbone.conv1.weight' layer
+        layers_conv_layers_list = ["backbone.conv1.weight", 
+                                   "backbone.layer1.0.conv1.weight", "backbone.layer1.0.conv2.weight", "backbone.layer1.0.conv3.weight", 
+                                   "backbone.layer1.1.conv1.weight", "backbone.layer1.1.conv2.weight", "backbone.layer1.1.conv3.weight", 
+                                   "backbone.layer1.2.conv1.weight", "backbone.layer1.2.conv2.weight", "backbone.layer1.2.conv3.weight",
+                                  #  "backbone.layer2.0.conv1.weight", "backbone.layer2.0.conv2.weight", "backbone.layer2.0.conv3.weight",
+                                  #  "backbone.layer2.1.conv1.weight", "backbone.layer2.1.conv2.weight", "backbone.layer2.1.conv3.weight",
+                                  #  "backbone.layer2.2.conv1.weight", "backbone.layer2.2.conv2.weight", "backbone.layer2.2.conv3.weight",
+                                   ]
+        for name, param in model.named_parameters():
+            if name in layers_conv_layers_list:
+                param.requires_grad = False
+                print(f"Froze layer: {name}")
+            # else:
+            #     print(f"Did not freeze: {name}")
 
-    print('FOLD : ',fold)
-    wandb_logger.watch(model, log="all", log_freq=100)
-    multiplicative = lambda epoch: 0.9
+        
+        print('FOLD : ',fold)
+        # wandb_logger.watch(model, log="all", log_freq=100)
+        # multiplicative = lambda epoch: 0.9
 
-    trainer = pl.Trainer(
-        max_epochs=50,
-        accelerator="gpu",
-        devices=8,
-        check_val_every_n_epoch=4,
-        logger=wandb_logger,
-        default_root_dir="./models",
-        accumulate_grad_batches=1,
-        precision='16-mixed',
-        gradient_clip_val=1.0,
-        gradient_clip_algorithm="norm",
-        strategy='ddp_find_unused_parameters_true',
-        callbacks=[ModelCheckpoint(filename=f'wild14_deduped_64_pretrained2_{fid}_{fold}_fr_{enc}'+'{epoch}',dirpath=CFG.model_dir,monitor='train/total_loss',mode='min',save_top_k=CFG.epochs),
+        from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+        # Define the EarlyStopping callback
+        early_stopping = EarlyStopping(
+            monitor='val/total_loss',  # Monitor validation MSE loss
+            patience=4,              # Stop training after 4 epochs without improvement
+            verbose=True,            # Enable logging
+            mode='min',              # We want to minimize the validation loss
+            check_on_train_epoch_end=False  # Check metric only at validation epoch end
+        )
 
-                    ],
+        trainer = pl.Trainer(
+            max_epochs=30,
+            accelerator="gpu",
+            # devices=8,
+            # check_val_every_n_epoch=5,
+            # logger=wandb_logger,
+            default_root_dir="./models",
+            accumulate_grad_batches=1,
+            precision='16-mixed',
+            gradient_clip_val=1.0,
+            gradient_clip_algorithm="norm",
+            strategy='ddp_find_unused_parameters_true',
+            callbacks=[ModelCheckpoint(
+                filename=f'finetuned_7_45_exposedfrag_og_resnet_wild14_frags_extended4_18chans_{fid}_{fold}_fr_{enc}'+'{epoch}',
+                dirpath=CFG.model_dir,
+                monitor='train/total_loss',
+                mode='min',
+                save_top_k=-1,
+                every_n_epochs = 1),
+                # early_stopping
+                        ],
+        )
 
-    )
-    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
-
-    wandb.finish()
+        #https://www.perplexity.ai/search/what-are-the-keys-stored-in-a-2mbWRfpAQF.S9sS.tK4ifw
+        trainer.fit(model=model, train_dataloaders=train_loader)
+        del train_images,train_loader,train_masks,valid_loader,model
+        torch.cuda.empty_cache()
+        gc.collect()
+        #wandb.finish()

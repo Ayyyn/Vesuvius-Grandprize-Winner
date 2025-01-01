@@ -3,111 +3,85 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
+from warmup_scheduler import GradualWarmupScheduler
 import argparse
-# from timm.data.mixup import Mixup
-from sklearn.metrics import fbeta_score
-from timesformer_pytorch import TimeSformer
-import wandb
-
-import torchvision.models as models
 import random
-import sys
-import yaml
-
 import numpy as np
 import pandas as pd
-
-
 import gc
 
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, StochasticWeightAveraging,BackboneFinetuning
-import numpy as np
+
 import scipy.stats as st
 import matplotlib.pyplot as plt
+
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, log_loss
+from torch.utils.data import DataLoader
+import cv2
+import segmentation_models_pytorch as smp
+from tqdm.auto import tqdm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam, SGD, AdamW
+import numpy as np
+from torch.utils.data import DataLoader, Dataset
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import PIL.Image
+from PIL import Image
+from resnetall import generate_model
+PIL.Image.MAX_IMAGE_PIXELS = 933120000
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+from tap import Tap
+class InferenceArgumentParser(Tap):
+    parser = argparse.ArgumentParser(description="Process a value dynamically.")
+    parser.add_argument('--segment_id', help="Segment id for inference")
+    parser.add_argument('--segment_path', help="Path of segment for inference")
+    parser.add_argument('--model_path', help="Model path")
+    parser.add_argument('--out_path', help="inference output path")
+    parser.add_argument('--model_name', help="model name")
+
+    #example command with arguments
+    #python inference_timesformer.py --segment_id 20230701020044 --segment_path /path/to/segment --model_path /path/to/model --out_path /path/to/output
+    # Parse the arguments
+    args = parser.parse_args()
+
+    segment_id: list[str] =args.segment_id
+    segment_path:str=args.segment_path
+    model_path:str=args.model_path
+    out_path:str=args.out_path
+    model_name:str=args.model_name
+
+    print(f"{segment_id=}")
+    print(f"{segment_path=}")
+    print(f"{model_path=}")
+    print(f"{out_path=}")
+    print(f"{model_name=}")
+
+args = InferenceArgumentParser().parse_args()
 def gkern(kernlen=21, nsig=3):
     """Returns a 2D Gaussian kernel."""
-
     x = np.linspace(-nsig, nsig, kernlen+1)
     kern1d = np.diff(st.norm.cdf(x))
     kern2d = np.outer(kern1d, kern1d)
     return kern2d/kern2d.sum()
 
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, log_loss
-import pickle
-from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
-import warnings
-import sys
-import pandas as pd
-import os
-import gc
-import sys
-import math
-import time
-import random
-import shutil
-from pathlib import Path
-from contextlib import contextmanager
-from collections import defaultdict, Counter
-import cv2
-
-import scipy as sp
-import numpy as np
-import pandas as pd
-import segmentation_models_pytorch as smp
-import matplotlib.pyplot as plt
-from tqdm.auto import tqdm
-from functools import partial
-
-import argparse
-import importlib
-import torch
-import torch.nn as nn
-from torch.optim import Adam, SGD, AdamW
-
-import datetime
-import numpy as np
-from torch.utils.data import DataLoader, Dataset
-import cv2
-import torch
-import os
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-from albumentations import ImageOnlyTransform
-import os
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-from timm.models.convnext import convnextv2_femto,convnextv2_nano
-import torch
-import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence
-import torch.nn.functional as F
-import PIL.Image
-from models.i3dallnl import InceptionI3d
-from models.resnetall import generate_model
-PIL.Image.MAX_IMAGE_PIXELS = 933120000
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 class CFG:
     # ============== comp exp name =============
     comp_name = 'vesuvius'
 
     comp_dir_path = './'
     comp_folder_name = './'
-    comp_dataset_path = f'./'
+    comp_dataset_path = ''
     
     exp_name = 'pretraining_all'
-
-    # ============== pred target =============
-    target_size = 1
-
     # ============== model cfg =============
-    model_name = 'Unet'
-    backbone = 'efficientnet-b0'
+    # model_name = 'Unet'
+    # backbone = 'efficientnet-b0'
     # backbone = 'se_resnext50_32x4d'
 
     in_chans = 30 # 65
@@ -115,83 +89,24 @@ class CFG:
     # ============== training cfg =============
     size = 64
     tile_size = 64
-    stride = tile_size // 3
+    # stride = tile_size // 3
+    stride = 16
 
     train_batch_size = 256 # 32
-    valid_batch_size = 256
+    valid_batch_size = 1024
     use_amp = True
 
     scheduler = 'GradualWarmupSchedulerV2'
-    # scheduler = 'CosineAnnealingLR'
     epochs = 50 # 30
 
     # adamW warmupあり
     warmup_factor = 10
     # lr = 1e-4 / warmup_factor
     lr = 1e-4 / warmup_factor
-
-    # ============== fold =============
-    valid_id = 2
-
-    # objective_cv = 'binary'  # 'binary', 'multiclass', 'regression'
-    metric_direction = 'maximize'  # maximize, 'minimize'
-    # metrics = 'dice_coef'
-
-    # ============== fixed =============
-    pretrained = True
-    inf_weight = 'best'  # 'best'
-
     min_lr = 1e-6
-    weight_decay = 1e-6
-    max_grad_norm = 5
-
-    print_freq = 50
     num_workers = 16
-
     seed = 42
-
-    # ============== set dataset path =============
-    print('set dataset path')
-
-    outputs_path = f'./outputs/{comp_name}/{exp_name}/'
-
-    submission_dir = outputs_path + 'submissions/'
-    submission_path = submission_dir + f'submission_{exp_name}.csv'
-
-    model_dir = outputs_path + \
-        f'{comp_name}-models/'
-
-    figures_dir = outputs_path + 'figures/'
-
-    log_dir = outputs_path + 'logs/'
-    log_path = log_dir + f'{exp_name}.txt'
-
     # ============== augmentation =============
-    train_aug_list = [
-        # A.RandomResizedCrop(
-        #     size, size, scale=(0.85, 1.0)),
-        A.Resize(size, size),
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.5),
-        A.RandomBrightnessContrast(p=0.75),
-        A.ShiftScaleRotate(rotate_limit=90,shift_limit=0.1,scale_limit=0.1,p=0.5),
-        A.OneOf([
-                A.GaussNoise(var_limit=[10, 50]),
-                A.GaussianBlur(),
-                A.MotionBlur(),
-                ], p=0.4),
-        A.GridDistortion(num_steps=2, distort_limit=0.3, p=0.4),
-        A.CoarseDropout(max_holes=5, max_width=int(size * 0.05), max_height=int(size * 0.05), 
-                        mask_fill_value=0, p=0.5),
-        # A.Cutout(max_h_size=int(size * 0.6),
-        #          max_w_size=int(size * 0.6), num_holes=1, p=1.0),
-        A.Normalize(
-            mean= [0] * in_chans,
-            std= [1] * in_chans
-        ),
-        ToTensorV2(transpose_mask=True),
-    ]
-
     valid_aug_list = [
         A.Resize(size, size),
         A.Normalize(
@@ -200,35 +115,6 @@ class CFG:
         ),
         ToTensorV2(transpose_mask=True),
     ]
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-def init_logger(log_file):
-    from logging import getLogger, INFO, FileHandler, Formatter, StreamHandler
-    logger = getLogger(__name__)
-    logger.setLevel(INFO)
-    handler1 = StreamHandler()
-    handler1.setFormatter(Formatter("%(message)s"))
-    handler2 = FileHandler(filename=log_file)
-    handler2.setFormatter(Formatter("%(message)s"))
-    logger.addHandler(handler1)
-    logger.addHandler(handler2)
-    return logger
-
 def set_seed(seed=None, cudnn_deterministic=True):
     if seed is None:
         seed = 42
@@ -240,51 +126,38 @@ def set_seed(seed=None, cudnn_deterministic=True):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = cudnn_deterministic
     torch.backends.cudnn.benchmark = False
-def make_dirs(cfg):
-    for dir in [cfg.model_dir, cfg.figures_dir, cfg.submission_dir, cfg.log_dir]:
-        os.makedirs(dir, exist_ok=True)
+
+# def make_dirs(cfg):
+#     for dir in [cfg.model_dir, cfg.figures_dir, cfg.submission_dir, cfg.log_dir]:
+#         os.makedirs(dir, exist_ok=True)
 def cfg_init(cfg, mode='train'):
     set_seed(cfg.seed)
-    # set_env_name()
-    # set_dataset_path(cfg)
-
-    if mode == 'train':
-        make_dirs(cfg)
 cfg_init(CFG)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-def read_image_mask(fragment_id,start_idx=18,end_idx=38,rotation=0):
-
+def read_image_mask(fragment_id,start_idx=18,end_idx=42,rotation=0):
     images = []
-
-    # idxs = range(65)
-    mid = 65 // 2
-    start = mid - CFG.in_chans // 2
-    end = mid + CFG.in_chans // 2
+    # mid = 65 // 2
+    # start = mid - CFG.in_chans // 2
+    # end = mid + CFG.in_chans // 2
     idxs = range(start_idx, end_idx)
-    # idxs = range(0, 65)
-
     for i in idxs:
-        
-        image = cv2.imread(f"./train_scrolls/{fragment_id}/layers/{i:02}.tif", 0)
-
+        image = cv2.imread(f"{args.segment_path}/{fragment_id}/layers/{i:03}.tif", 0)
         pad0 = (256 - image.shape[0] % 256)
         pad1 = (256 - image.shape[1] % 256)
-
         image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
         # image = ndimage.median_filter(image, size=5)
         image=np.clip(image,0,200)
         # image = cv2.flip(image, 0)
-
         images.append(image)
     images = np.stack(images, axis=2)
     if fragment_id in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']:
         images=images[:,:,::-1]
+    print("Images' stack created")
 
     fragment_mask=None
-    if os.path.exists(f'./train_scrolls/{fragment_id}/{fragment_id}_mask.png'):
-        fragment_mask=cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_mask.png", 0)
+    if os.path.exists(f'{args.segment_path}/{fragment_id}/{fragment_id}_mask.png'):
+        fragment_mask=cv2.imread(CFG.comp_dataset_path + f"{args.segment_path}/{fragment_id}/{fragment_id}_mask.png", 0)
         fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
 
     return images,fragment_mask
@@ -293,6 +166,8 @@ def get_img_splits(fragment_id,s,e,rotation=0):
     images = []
     xyxys = []
     image,fragment_mask = read_image_mask(fragment_id,s,e,rotation)
+    print("image mask craeted of shape: ",image.shape)
+    print("fragment mask created of shape: ",fragment_mask.shape)
     x1_list = list(range(0, image.shape[1]-CFG.tile_size+1, CFG.stride))
     y1_list = list(range(0, image.shape[0]-CFG.tile_size+1, CFG.stride))
     for y1 in y1_list:
@@ -319,12 +194,8 @@ def get_img_splits(fragment_id,s,e,rotation=0):
     return test_loader, np.stack(xyxys),(image.shape[0],image.shape[1]),fragment_mask
 
 def get_transforms(data, cfg):
-    if data == 'train':
-        aug = A.Compose(cfg.train_aug_list)
-    elif data == 'valid':
+    if data == 'valid':
         aug = A.Compose(cfg.valid_aug_list)
-
-    # print(aug)
     return aug
 
 class CustomDataset(Dataset):
@@ -335,7 +206,7 @@ class CustomDataset(Dataset):
         self.transform = transform
         self.xyxys=xyxys
         self.kernel=gkern(64,2)
-        self.kernel/=self.kernel.max()
+        self.kernel/=(self.kernel.max() + 1e-8)
         self.kernel=torch.FloatTensor(self.kernel)
     def __len__(self):
         # return len(self.df)
@@ -378,7 +249,7 @@ class CustomDatasetTest(Dataset):
     def __len__(self):
         # return len(self.df)
         return len(self.images)
-
+    
     def __getitem__(self, idx):
         image = self.images[idx]
         xy=self.xyxys[idx]
@@ -424,67 +295,25 @@ class Decoder(nn.Module):
 
 
 from collections import OrderedDict
-
-
-
-
 class RegressionPLModel(pl.LightningModule):
-    def __init__(self,pred_shape,size=224,enc='',with_norm=False):
+    def __init__(self,pred_shape,size=256,enc='',with_norm=False,total_steps=780):
         super(RegressionPLModel, self).__init__()
 
         self.save_hyperparameters()
         self.mask_pred = np.zeros(self.hparams.pred_shape)
         self.mask_count = np.zeros(self.hparams.pred_shape)
-        # self.backbone=SegModel(model_depth=50)
-        self.loss_func1 = smp.losses.DiceLoss(mode='binary')
-        # self.loss_func2= smp.losses.FocalLoss(mode='binary',gamma=2)
-        self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.15)
-        # self.loss_func=nn.HuberLoss(delta=5.0)
-        self.loss_func= lambda x,y:0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
-        
-        # self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=700)
-        if self.hparams.enc=='resnet34':
-            self.backbone = generate_model(model_depth=34, n_input_channels=1,forward_features=True,n_classes=700)
-            state_dict=torch.load('./r3d34_K_200ep.pth')["state_dict"]
-            conv1_weight = state_dict['conv1.weight']
-            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict,strict=False)
-        elif self.hparams.enc=='resnest101':
-            self.backbone = generate_model(model_depth=101, n_input_channels=1,forward_features=True,n_classes=1039)
-            state_dict=torch.load('./r3d101_KM_200ep.pth')["state_dict"]
-            conv1_weight = state_dict['conv1.weight']
-            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict,strict=False)
-        elif self.hparams.enc=='2p1d':
-            self.backbone = generate_2p1d(model_depth=34, n_input_channels=1,n_classes=700)
-            state_dict=torch.load('./r2p1d34_K_200ep.pth')["state_dict"]
-            conv1_weight = state_dict['conv1_s.weight']
-            state_dict['conv1_s.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict,strict=False)
-        elif self.hparams.enc=='wide50':
-            self.backbone = generate_wide(model_depth=50, n_input_channels=1,n_classes=700,forward_features=True,k=2)
-        elif self.hparams.enc=='i3d':
-            self.backbone=InceptionI3d(in_channels=1,num_classes=512,non_local=True)
-        elif self.hparams.enc=='resnext101':
-            self.backbone=resnext101(sample_size=112,
-                                  sample_duration=16,
-                                  shortcut_type='B',
-                                  cardinality=32,
-                                  num_classes=600)
-            state_dict = torch.load('./kinetics_resnext_101_RGB_16_best.pth')['state_dict']
-            checkpoint_custom = OrderedDict()
-            for key_model, key_checkpoint in zip(self.backbone.state_dict().keys(), state_dict.keys()):
-                checkpoint_custom.update({f'{key_model}': state_dict[f'{key_checkpoint}']})
 
-            self.backbone.load_state_dict(checkpoint_custom, strict=True)
-            self.backbone.conv1 = nn.Conv3d(1, 64, kernel_size=(7, 7, 7), stride=(1, 2, 2), padding=(3, 3, 3), bias=False)
-        else:
-            self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=700)
-            state_dict=torch.load('./r3d50_K_200ep.pth')["state_dict"]
-            conv1_weight = state_dict['conv1.weight']
-            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict,strict=False)
-        
+        self.loss_func1 = smp.losses.DiceLoss(mode='binary')
+        self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
+        self.loss_func= lambda x,y:0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
+        # if self.hparams.enc=='resnest101':
+        self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=1139)
+        # state_dict=torch.load('./r3d101_KM_200ep.pth')["state_dict"]
+        state_dict=torch.load(args.model_path)["state_dict"]
+        # conv1_weight = state_dict['conv1.weight']
+        # state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
+        self.backbone.load_state_dict(state_dict,strict=False)
+
         self.decoder = Decoder(encoder_dims=[x.size(1) for x in self.backbone(torch.rand(1,1,20,256,256))], upscale=1)
 
         if self.hparams.with_norm:
@@ -499,6 +328,7 @@ class RegressionPLModel(pl.LightningModule):
         pred_mask = self.decoder(feat_maps_pooled)
         
         return pred_mask
+    
     def training_step(self, batch, batch_idx):
         x, y = batch
         outputs = self(x)
@@ -523,7 +353,7 @@ class RegressionPLModel(pl.LightningModule):
     
     def on_validation_epoch_end(self):
         self.mask_pred = np.divide(self.mask_pred, self.mask_count, out=np.zeros_like(self.mask_pred), where=self.mask_count!=0)
-        wandb_logger.log_image(key="masks", images=[np.clip(self.mask_pred,0,1)], caption=["probs"])
+        # wandb_logger.log_image(key="masks", images=[np.clip(self.mask_pred,0,1)], caption=["probs"])
 
         #reset mask
         self.mask_pred = np.zeros(self.hparams.pred_shape)
@@ -532,15 +362,6 @@ class RegressionPLModel(pl.LightningModule):
         optimizer = AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=CFG.lr)    
         scheduler = get_scheduler(CFG, optimizer)
         return [optimizer]
-import torch.nn as nn
-import torch
-import math
-import time
-import numpy as np
-import torch
-
-from warmup_scheduler import GradualWarmupScheduler
-
 
 class GradualWarmupSchedulerV2(GradualWarmupScheduler):
     """
@@ -574,42 +395,7 @@ def get_scheduler(cfg, optimizer):
 
 def scheduler_step(scheduler, avg_val_loss, epoch):
     scheduler.step(epoch)
-   
-import torch as tc
-def TTA(x:tc.Tensor,model:nn.Module):
-    #x.shape=(batch,c,h,w)
-    shape=x.shape
-    x=[x,*[tc.rot90(x,k=i,dims=(-2,-1)) for i in range(1,4)],]
-    x=tc.cat(x,dim=0)
-    x=model(x)
-    # x=torch.sigmoid(x)
-    # print(x.shape)
-    x=x.reshape(4,shape[0],CFG.size//4,CFG.size//4)
-    
-    x=[tc.rot90(x[i],k=-i,dims=(-2,-1)) for i in range(4)]
-    x=tc.stack(x,dim=0)
-    return x.mean(0)
 
-DiceLoss = smp.losses.DiceLoss(mode='binary')
-BCELoss = smp.losses.SoftBCEWithLogitsLoss()
-FocalLoss=smp.losses.FocalLoss(gamma=2.5,mode='binary')
-alpha = 0.5
-beta = 1 - alpha
-TverskyLoss = smp.losses.TverskyLoss(
-    mode='binary', log_loss=False, alpha=alpha, beta=beta)
-MSELoss=nn.MSELoss()
-HuberLoss=nn.HuberLoss(delta=5.0)
-NNBCE=nn.BCEWithLogitsLoss(pos_weight=torch.ones([1]).to('cuda')*5 )
-def criterion(y_pred, y_true):
-    # return 0.5 * BCELoss(y_pred, y_true) + 0.5 * DiceLoss(y_pred, y_true)
-    return HuberLoss(y_pred, y_true)
-def normalization(x):
-    """input.shape=(batch,f1,f2,...)"""
-    #[batch,f1,f2]->dim[1,2]
-    dim=list(range(1,x.ndim))
-    mean=x.mean(dim=dim,keepdim=True)
-    std=x.std(dim=dim,keepdim=True)
-    return (x-mean)/(std+1e-9)
 def predict_fn(test_loader, model, device, test_xyxys,pred_shape):
     mask_pred = np.zeros(pred_shape)
     mask_count = np.zeros(pred_shape)
@@ -623,62 +409,50 @@ def predict_fn(test_loader, model, device, test_xyxys,pred_shape):
         with torch.no_grad():
             with torch.autocast(device_type="cuda"):
                 y_preds = model(images)
-            # y_preds =TTA(images,model)
-        # y_preds = y_preds.to('cpu').numpy()
-
         y_preds = torch.sigmoid(y_preds).to('cpu')
         for i, (x1, y1, x2, y2) in enumerate(xys):
             mask_pred[y1:y2, x1:x2] += np.multiply(F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy(),kernel)
             # mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy()
             mask_count[y1:y2, x1:x2] += np.ones((CFG.size, CFG.size))
 
-    mask_pred /= mask_count
-    # mask_pred/=mask_pred.max()
+    print(f"Zeros in mask_count: {np.sum(mask_count == 0)} out of {mask_count.size}")
+    mask_pred /= (mask_count + 1e-8)
+
     return mask_pred
     # return losses.avg,[]
-from PIL import Image
-from PIL.ImageOps import equalize,autocontrast
-import gc
-import time
-
-
-for m in ['wild14_deduped_64_pretrained2_20231005123336_0_fr_i3depoch=23.ckpt']:
-    # model=torch.jit.load(f'models_norm/{m}')
-    model=RegressionPLModel.load_from_checkpoint(CFG.model_dir+m,strict=False,enc='resnest101')
-    model.cuda()
+if __name__ == "__main__":
+    model=RegressionPLModel.load_from_checkpoint(args.model_path,strict=False,enc='resnest101')
+    model.to(device)
+    # model.cuda()
+    model = torch.compile(model)
     model.eval()
-    wandb.init(
-      # Set the project where this run will be logged
-      project="vesivus", 
-      # We pass a run name (otherwise it’ll be randomly assigned, like sunshine-lollypop-10)
-      name=f"ALL_scrolls_tta_{m}", 
-      # Track hyperparameters and run metadata
-        )
-    for fragment_id in ['20231005123336']:
-    # for fragment_id in os.listdir('train_scrolls'):
-        if os.path.exists(f"train_scrolls/{fragment_id}/layers/00.tif"):
+
+    for fragment_id in args.segment_id:
+        print(f"Processing {fragment_id=}")
+        i = 20
+        if os.path.exists(f"{args.segment_path}/{fragment_id}/layers/070.tif"):
             preds=[]
             for r in [0]:
-                for i in [17]:
+                for i in [60]:
                     start_f=i
+                    print(f'{start_f=}')
                     end_f=start_f+CFG.in_chans
+                    print(f"{end_f=}")
                     test_loader,test_xyxz,test_shape,fragment_mask=get_img_splits(fragment_id,start_f,end_f,r)
                     mask_pred= predict_fn(test_loader, model, device, test_xyxz,test_shape)
                     mask_pred=np.clip(np.nan_to_num(mask_pred),a_min=0,a_max=1)
-                    mask_pred/=mask_pred.max()
+                    mask_pred/= (mask_pred.max() + 1e-8)
+                    mask_pred = (mask_pred * 255).astype(np.uint8)
 
                     preds.append(mask_pred)
-
-            img=wandb.Image(
-            preds[0], 
-            caption=f"{fragment_id}"
-            )
-            wandb.log({'predictions':img})
-
-            # print("plot time: ",t5-t4)
+            
+            os.makedirs(f'{args.out_path}', exist_ok=True)
+            img = Image.fromarray(preds[0])
+            img.save(f"{args.out_path}/{fragment_id}-mname_{args.model_name}-s_{start_f}-e_{end_f}-stride_{CFG.stride}.png")
             gc.collect()
-        
+        else:
+            print("******Path doesn't exist******")
     del mask_pred,test_loader,model
     torch.cuda.empty_cache()
     gc.collect()
-    wandb.finish()
+    #wandb.finish()
